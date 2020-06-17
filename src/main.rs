@@ -92,9 +92,9 @@ async fn play(mut inst: Instrument, channel: u8, messages: Vec<Message>) {
     let convert = |e: &Message| match e {
         Message::MidiEvent { delta_time, event } => match &event {
             MidiEvent::NoteOn { ch, note, velocity } if *ch == channel => Some(Sound {
-                time: ((*delta_time as u64) * 3 / 5) / 10 * 10,
+                time: (*delta_time as u64) / 10 * 10,
                 note: if *velocity > 0 {
-                    (*note).try_into().unwrap()
+                    (*note - 12).try_into().unwrap()
                 } else {
                     Note::NoSound
                 },
@@ -184,7 +184,7 @@ async fn main() {
         })
         .collect();
 
-    let _ = futures::future::select_all(tracks).await;
+    let _ = futures::future::join_all(tracks).await;
 
     info!("Finish");
 }
