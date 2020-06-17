@@ -106,6 +106,10 @@ async fn play(mut inst: Instrument, channel: u8, messages: Vec<Message>) {
 
     let mut iter = iter.filter_map(convert).peekable();
 
+    if let Some(e0) = iter.peek() {
+        delay_for(Duration::from_millis(e0.time)).await;
+    }
+
     while let Some(e1) = iter.next() {
         let e2 = if let Some(e2) = iter.peek() {
             e2
