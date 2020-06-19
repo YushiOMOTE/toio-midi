@@ -24,9 +24,9 @@ struct Opt {
     /// Rules to assign tracks to cube
     #[structopt(short = "r", long = "rule", parse(try_from_str))]
     rules: Vec<Rule>,
-    /// Tempo
-    #[structopt(short = "t", long = "tempo", default_value = "1000")]
-    tempo: u64,
+    /// Speed
+    #[structopt(short = "s", long = "speed", default_value = "100")]
+    speed: u64,
     /// Time-slice size used on merge
     #[structopt(short = "u", long = "unit", default_value = "40")]
     unit: u64,
@@ -92,11 +92,11 @@ impl Instrument {
     }
 }
 
-async fn play(inst: &mut Instrument, track: u8, map: EventMap) {
+async fn play(inst: &mut Instrument, track: u8, map: EventMap, speed: u64) {
     let events = map.get(&track).cloned().unwrap_or_else(|| vec![]);
 
     for e in events {
-        inst.add(e.note, e.time).await;
+        inst.add(e.note, e.time * 100 / speed).await;
     }
 
     inst.play().await;
@@ -115,6 +115,10 @@ async fn main() -> Result<()> {
         let tracks = midi::list(&opt.file)?;
         info!("Available tracks: {:?}", tracks);
         return Ok(());
+    }
+
+    if opt.speed == 0 {
+        return Err(anyhow!("Speed must be non-zero"));
     }
 
     let events = midi::load(&opt.file, opt.unit, &opt.rules)?;
@@ -146,6 +150,7 @@ async fn main() -> Result<()> {
             let events = events.clone();
             let begin = begin.clone();
             let end = end.clone();
+            let speed = opt.speed;
 
             tokio::spawn(async move {
                 let track = track as u8;
@@ -164,7 +169,7 @@ async fn main() -> Result<()> {
                 begin.wait().await;
 
                 let mut inst = Instrument::new(cube);
-                play(&mut inst, track, events).await;
+                play(&mut inst, track, events, speed).await;
 
                 info!("Cube {} finishes playing", track);
 
