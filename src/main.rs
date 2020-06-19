@@ -87,11 +87,11 @@ impl Instrument {
     }
 }
 
-async fn play(mut inst: Instrument, channel: u8, tempo: u64, map: EventMap) {
+async fn play(mut inst: Instrument, channel: u8, map: EventMap) {
     let events = map.get(&channel).cloned().unwrap_or_else(|| vec![]);
 
     for e in events {
-        inst.add(e.note, e.time * 1000 / tempo).await;
+        inst.add(e.note, e.time).await;
     }
 
     inst.play().await;
@@ -106,9 +106,13 @@ async fn main() -> Result<()> {
 
     env_logger::init();
 
-    let events = midi::load(&opt.file, opt.unit, &opt.rules)?;
+    let events = midi::load(&opt.file, opt.unit, opt.tempo, &opt.rules)?;
 
     let mut cubes = Cube::search().all().await?;
+
+    if cubes.is_empty() {
+        return Err(anyhow!("No cube found"));
+    }
 
     for cube in cubes.iter_mut() {
         cube.connect().await?;
@@ -132,12 +136,11 @@ async fn main() -> Result<()> {
         .map(|(channel, mut cube)| {
             let events = events.clone();
             let mut rx = tx.subscribe();
-            let tempo = opt.tempo;
 
             tokio::spawn(async move {
                 let channel = channel as u8;
 
-                info!("Start playing channel: {}", channel);
+                info!("Cube {} is ready", channel);
 
                 // Turn on the light.
                 cube.light_on(
@@ -152,7 +155,7 @@ async fn main() -> Result<()> {
                 rx.next().await.ok_or_else(|| anyhow!("Broken barrier"))??;
 
                 let inst = Instrument::new(cube);
-                play(inst, channel, tempo, events).await;
+                play(inst, channel, events).await;
 
                 Ok::<_, Error>(())
             })

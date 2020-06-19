@@ -59,22 +59,20 @@ impl Event {
     }
 }
 
-fn parse(file: &Path) -> Result<MessageHandler> {
-    let mut handler = MessageHandler::new();
+pub fn load(file: &Path, unit: u64, tempo: u64, rules: &[Rule]) -> Result<EventMap> {
+    let mut handler = MessageHandler::new(tempo);
     let mut reader = Reader::new(&mut handler, file).map_err(|e| anyhow!("{}", e))?;
     let _ = reader.read();
-
-    Ok(handler)
-}
-
-pub fn load(file: &Path, unit: u64, rules: &[Rule]) -> Result<EventMap> {
-    let mut handler = parse(file)?;
 
     if rules.is_empty() {
         return Ok(handler.default());
     }
 
     for rule in rules {
+        info!(
+            "Cube {} plays channels {:?}",
+            rule.as_channel, rule.channels
+        );
         handler.merge(unit, &rule)?;
     }
 
@@ -82,13 +80,15 @@ pub fn load(file: &Path, unit: u64, rules: &[Rule]) -> Result<EventMap> {
 }
 
 struct MessageHandler {
+    tempo: u64,
     map: HashMap<u8, VecDeque<Event>>,
     merged: EventMap,
 }
 
 impl MessageHandler {
-    fn new() -> Self {
+    fn new(tempo: u64) -> Self {
         Self {
+            tempo,
             map: HashMap::new(),
             merged: HashMap::new(),
         }
@@ -107,17 +107,6 @@ impl MessageHandler {
     }
 
     fn merge(&mut self, unit: u64, rule: &Rule) -> Result<()> {
-        if rule.channels.len() == 1 {
-            let seq = self
-                .map
-                .get(&rule.channels[0])
-                .cloned()
-                .ok_or_else(|| anyhow!("No such channel: {}", rule.channels[0]))?;
-            self.merged
-                .insert(rule.as_channel, seq.into_iter().collect());
-            return Ok(());
-        }
-
         let mut merged = vec![];
         let seqs: Result<Vec<_>> = rule
             .channels
@@ -132,11 +121,13 @@ impl MessageHandler {
         let mut seqs = seqs?;
         let mut at = 0;
 
+        let slice = 1;
+
         for i in 0.. {
             let mut notes = HashMap::new();
             let mut nodata = true;
 
-            debug!("---");
+            trace!("---");
 
             for (ch, seq) in seqs.iter_mut().enumerate() {
                 let e = match seq.front() {
@@ -145,13 +136,13 @@ impl MessageHandler {
                 };
                 nodata = false;
 
-                debug!("{}-{}: ch={}: {:?}", at, at + unit, ch, e);
+                trace!("{}-{}: ch={}: {:?}", at, at + slice, ch, e);
 
-                if !(e.at + e.time < at || at + unit <= e.at) && e.note != Note::NoSound {
-                    notes.insert(ch, Event::new(e.note, unit, at));
+                if !(e.at + e.time < at || at + slice <= e.at) && e.note != Note::NoSound {
+                    notes.insert(ch, Event::new(e.note, slice, at));
                 }
 
-                if e.at + e.time <= at + unit {
+                if e.at + e.time <= at + slice {
                     seq.pop_front();
                 }
             }
@@ -161,24 +152,24 @@ impl MessageHandler {
             }
 
             if notes.is_empty() {
-                debug!("* {}-{}: no sound", at, at + unit);
-                merged.push(Event::new(Note::NoSound, unit, at))
+                trace!("* {}-{}: no sound", at, at + slice);
+                merged.push(Event::new(Note::NoSound, slice, at))
             } else if notes.len() == 1 {
                 let e = notes.values().next().unwrap().clone();
-                debug!("* {}-{}: {:?}", at, at + unit, e);
+                trace!("* {}-{}: {:?}", at, at + slice, e);
                 merged.push(e);
             } else {
                 let mut chs: Vec<_> = notes.keys().collect();
                 chs.sort();
-                let ch = chs[i % chs.len()];
+                let ch = chs[(i / unit as usize) % chs.len()];
                 let e = notes.get(ch).unwrap().clone();
-                debug!("* {}-{}: {:?} (ch={})", at, at + unit, e, ch);
+                trace!("* {}-{}: {:?} (ch={})", at, at + slice, e, ch);
                 merged.push(e);
             }
 
             notes.clear();
 
-            at += unit;
+            at += slice;
         }
 
         let mut squashed: Vec<Event> = vec![];
@@ -209,7 +200,7 @@ impl Handler for MessageHandler {
     fn midi_event(&mut self, delta: u32, event: &MidiEvent) {
         trace!("delta time: {:>4}, MIDI event: {}", delta, event);
 
-        let delta = delta as u64;
+        let delta = (delta as u64) * 1000 / self.tempo;
 
         match event {
             MidiEvent::NoteOn { ch, note, velocity } => {
