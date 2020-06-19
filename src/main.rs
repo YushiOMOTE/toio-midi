@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let events = midi::load(&opt.file, opt.unit, opt.tempo, &opt.rules)?;
+    let events = midi::load(&opt.file, opt.unit, &opt.rules)?;
 
     let mut cubes = Cube::search().all().await?;
 
