@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Error, Result};
+use anyhow::{anyhow, Context, Error, Result};
 use ghakuf::messages::*;
 use ghakuf::reader::*;
 use log::*;
@@ -40,10 +40,10 @@ impl std::str::FromStr for Rule {
             let as_channel = iter.next().ok_or_else(|| anyhow!("Invalid rule: {}", s))?;
             let channels = iter.next().ok_or_else(|| anyhow!("Invalid rule: {}", s))?;
 
-            let as_channel = as_channel.parse()?;
+            let as_channel = as_channel.parse().context(format!("Invalid rule: {}", s))?;
             let channels: Result<Vec<_>> = channels
                 .split(",")
-                .map(|channel| Ok(channel.parse()?))
+                .map(|channel| Ok(channel.parse().context(format!("Invalid rule: {}", s))?))
                 .collect();
 
             Ok(Rule::new(channels?, as_channel))
@@ -59,7 +59,21 @@ impl Event {
     }
 }
 
+pub fn list(file: &Path) -> Result<Vec<u8>> {
+    let mut handler = MessageHandler::new(1000);
+    let mut reader = Reader::new(&mut handler, file).map_err(|e| anyhow!("{}", e))?;
+    let _ = reader.read();
+
+    let mut channels: Vec<_> = handler.default().keys().cloned().collect();
+    channels.sort();
+    Ok(channels)
+}
+
 pub fn load(file: &Path, unit: u64, tempo: u64, rules: &[Rule]) -> Result<EventMap> {
+    if tempo == 0 {
+        return Err(anyhow!("Tempo must be non-zero"));
+    }
+
     let mut handler = MessageHandler::new(tempo);
     let mut reader = Reader::new(&mut handler, file).map_err(|e| anyhow!("{}", e))?;
     let _ = reader.read();

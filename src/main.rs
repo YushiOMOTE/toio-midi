@@ -18,6 +18,9 @@ struct Opt {
     /// MIDI file name
     #[structopt(name = "file")]
     file: PathBuf,
+    /// List channels
+    #[structopt(short = "l", long = "list")]
+    list: bool,
     /// Rules to assign channels to cube
     #[structopt(short = "r", long = "rule", parse(try_from_str))]
     rules: Vec<Rule>,
@@ -105,6 +108,12 @@ async fn main() -> Result<()> {
         env_logger::Env::default().default_filter_or(format!("{}=info", module_path!())),
     )
     .init();
+
+    if opt.list {
+        let channels = midi::list(&opt.file)?;
+        info!("Available channels: {:?}", channels);
+        return Ok(());
+    }
 
     let events = midi::load(&opt.file, opt.unit, opt.tempo, &opt.rules)?;
 
