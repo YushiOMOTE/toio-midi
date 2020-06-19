@@ -70,8 +70,8 @@ pub fn load(file: &Path, unit: u64, tempo: u64, rules: &[Rule]) -> Result<EventM
 
     for rule in rules {
         info!(
-            "Cube {} plays channels {:?}",
-            rule.as_channel, rule.channels
+            "Assign channels {:?} to cube {}",
+            rule.channels, rule.as_channel
         );
         handler.merge(unit, &rule)?;
     }

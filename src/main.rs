@@ -1,15 +1,15 @@
 mod midi;
 
 use anyhow::{anyhow, Error, Result};
-use futures::prelude::*;
 use log::*;
 use std::{
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use structopt::StructOpt;
 use toio::{Cube, Note, SoundOp};
-use tokio::time::delay_for;
+use tokio::{sync::Barrier, time::delay_for};
 
 use crate::midi::{EventMap, Rule};
 
@@ -87,7 +87,7 @@ impl Instrument {
     }
 }
 
-async fn play(mut inst: Instrument, channel: u8, map: EventMap) {
+async fn play(inst: &mut Instrument, channel: u8, map: EventMap) {
     let events = map.get(&channel).cloned().unwrap_or_else(|| vec![]);
 
     for e in events {
@@ -95,16 +95,16 @@ async fn play(mut inst: Instrument, channel: u8, map: EventMap) {
     }
 
     inst.play().await;
-
-    info!("Shutdown down in 5 seconds...");
-    delay_for(Duration::from_secs(5)).await;
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt = Opt::from_args();
 
-    env_logger::init();
+    env_logger::from_env(
+        env_logger::Env::default().default_filter_or(format!("{}=info", module_path!())),
+    )
+    .init();
 
     let events = midi::load(&opt.file, opt.unit, opt.tempo, &opt.rules)?;
 
@@ -118,16 +118,14 @@ async fn main() -> Result<()> {
         cube.connect().await?;
     }
 
-    let (tx, _) = tokio::sync::broadcast::channel(16);
+    let begin = Arc::new(Barrier::new(cubes.len() + 1));
+    let end = Arc::new(Barrier::new(cubes.len()));
 
-    info!("Starts in 3 seconds");
-
-    tokio::spawn({
-        let tx = tx.clone();
-        async move {
-            delay_for(Duration::from_secs(3)).await;
-            let _ = tx.send(());
-        }
+    let begin0 = begin.clone();
+    tokio::spawn(async move {
+        info!("Starts playing in 3 seconds...");
+        delay_for(Duration::from_secs(3)).await;
+        begin0.wait().await;
     });
 
     let tracks: Vec<_> = cubes
@@ -135,7 +133,8 @@ async fn main() -> Result<()> {
         .enumerate()
         .map(|(channel, mut cube)| {
             let events = events.clone();
-            let mut rx = tx.subscribe();
+            let begin = begin.clone();
+            let end = end.clone();
 
             tokio::spawn(async move {
                 let channel = channel as u8;
@@ -151,11 +150,18 @@ async fn main() -> Result<()> {
                 )
                 .await?;
 
-                // Fence to start at the same time.
-                rx.next().await.ok_or_else(|| anyhow!("Broken barrier"))??;
+                begin.wait().await;
 
-                let inst = Instrument::new(cube);
-                play(inst, channel, events).await;
+                let mut inst = Instrument::new(cube);
+                play(&mut inst, channel, events).await;
+
+                info!("Cube {} finishes playing", channel);
+
+                if end.wait().await.is_leader() {
+                    info!("Shutdown down in 5 seconds...");
+                }
+
+                delay_for(Duration::from_secs(5)).await;
 
                 Ok::<_, Error>(())
             })
