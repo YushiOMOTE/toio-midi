@@ -60,6 +60,7 @@ pub fn list(file: &Path) -> Result<Vec<u8>> {
     let mut handler = MessageHandler::new();
     let mut reader = Reader::new(&mut handler, file).map_err(|e| anyhow!("{}", e))?;
     let _ = reader.read();
+    handler.adjust();
 
     let mut tracks: Vec<_> = handler.default().keys().cloned().collect();
     tracks.sort();
