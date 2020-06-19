@@ -807,6 +807,7 @@ dependencies = [
 name = "toio-midi"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "env_logger",
  "futures",
  "ghakuf",

@@ -12,3 +12,4 @@ log = "0.4"
 toio = { path = "../toio-rs" }
 tokio = { version = "0.2", features = ["full"] }
 futures = "0.3"
+anyhow = "1.0"

@@ -1,10 +1,9 @@
 mod midi;
 
+use anyhow::{anyhow, Error, Result};
 use futures::prelude::*;
-use ghakuf::messages::{Message, MidiEvent};
 use log::*;
 use std::{
-    convert::TryInto,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -12,14 +11,22 @@ use structopt::StructOpt;
 use toio::{Cube, Note, SoundOp};
 use tokio::time::delay_for;
 
+use crate::midi::{EventMap, Rule};
+
 #[derive(StructOpt)]
 struct Opt {
     /// MIDI file name
     #[structopt(name = "file")]
     file: PathBuf,
-    /// Channels to assign to cubes
-    #[structopt(short = "c", long = "channel")]
-    channel: Vec<u8>,
+    /// Rules to assign channels to cube
+    #[structopt(short = "r", long = "rule", parse(try_from_str))]
+    rules: Vec<Rule>,
+    /// Tempo
+    #[structopt(short = "t", long = "tempo", default_value = "1000")]
+    tempo: u64,
+    /// Time-slice size used on merge
+    #[structopt(short = "u", long = "unit", default_value = "40")]
+    unit: u64,
 }
 
 struct Instrument {
@@ -80,44 +87,11 @@ impl Instrument {
     }
 }
 
-#[derive(Debug)]
-struct Sound {
-    time: u64,
-    note: Note,
-}
+async fn play(mut inst: Instrument, channel: u8, tempo: u64, map: EventMap) {
+    let events = map.get(&channel).cloned().unwrap_or_else(|| vec![]);
 
-async fn play(mut inst: Instrument, channel: u8, messages: Vec<Message>) {
-    let iter = messages.iter().peekable();
-
-    let convert = |e: &Message| match e {
-        Message::MidiEvent { delta_time, event } => match &event {
-            MidiEvent::NoteOn { ch, note, velocity } if *ch == channel => Some(Sound {
-                time: (*delta_time as u64) / 10 * 10,
-                note: if *velocity > 0 {
-                    (*note - 12).try_into().unwrap()
-                } else {
-                    Note::NoSound
-                },
-            }),
-            _ => None,
-        },
-        _ => None,
-    };
-
-    let mut iter = iter.filter_map(convert).peekable();
-
-    if let Some(e0) = iter.peek() {
-        delay_for(Duration::from_millis(e0.time)).await;
-    }
-
-    while let Some(e1) = iter.next() {
-        let e2 = if let Some(e2) = iter.peek() {
-            e2
-        } else {
-            break;
-        };
-
-        inst.add(e1.note, e2.time).await;
+    for e in events {
+        inst.add(e.note, e.time * 1000 / tempo).await;
     }
 
     inst.play().await;
@@ -127,17 +101,17 @@ async fn play(mut inst: Instrument, channel: u8, messages: Vec<Message>) {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let opt = Opt::from_args();
 
     env_logger::init();
 
-    let messages = midi::load(&opt.file);
+    let events = midi::load(&opt.file, opt.unit, &opt.rules)?;
 
-    let mut cubes = Cube::search().all().await.unwrap();
+    let mut cubes = Cube::search().all().await?;
 
     for cube in cubes.iter_mut() {
-        cube.connect().await.unwrap();
+        cube.connect().await?;
     }
 
     let (tx, _) = tokio::sync::broadcast::channel(16);
@@ -155,36 +129,41 @@ async fn main() {
     let tracks: Vec<_> = cubes
         .into_iter()
         .enumerate()
-        .map(|(i, mut cube)| {
-            let messages = messages.clone();
+        .map(|(channel, mut cube)| {
+            let events = events.clone();
             let mut rx = tx.subscribe();
-            let channel = opt.channel.clone();
+            let tempo = opt.tempo;
 
             tokio::spawn(async move {
-                let track = channel.get(i).cloned().unwrap_or(i as u8);
+                let channel = channel as u8;
 
-                info!("Start playing track: {}", track);
+                info!("Start playing channel: {}", channel);
 
                 // Turn on the light.
                 cube.light_on(
-                    ((track % 7 + 1) & 1u8) * 255,
-                    ((track % 7 + 1) >> 1u8 & 1u8) * 255,
-                    ((track % 7 + 1) >> 2u8 & 1u8) * 255,
+                    ((channel % 7 + 1) & 1u8) * 255,
+                    ((channel % 7 + 1) >> 1u8 & 1u8) * 255,
+                    ((channel % 7 + 1) >> 2u8 & 1u8) * 255,
                     None,
                 )
-                .await
-                .unwrap();
+                .await?;
 
                 // Fence to start at the same time.
-                rx.next().await.unwrap().unwrap();
+                rx.next().await.ok_or_else(|| anyhow!("Broken barrier"))??;
 
                 let inst = Instrument::new(cube);
-                play(inst, track, messages).await;
+                play(inst, channel, tempo, events).await;
+
+                Ok::<_, Error>(())
             })
         })
         .collect();
 
-    let _ = futures::future::join_all(tracks).await;
+    for res in futures::future::join_all(tracks).await {
+        res??;
+    }
 
     info!("Finish");
+
+    Ok(())
 }
