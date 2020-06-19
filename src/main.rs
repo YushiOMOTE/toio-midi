@@ -18,10 +18,10 @@ struct Opt {
     /// MIDI file name
     #[structopt(name = "file")]
     file: PathBuf,
-    /// List channels
+    /// List tracks
     #[structopt(short = "l", long = "list")]
     list: bool,
-    /// Rules to assign channels to cube
+    /// Rules to assign tracks to cube
     #[structopt(short = "r", long = "rule", parse(try_from_str))]
     rules: Vec<Rule>,
     /// Tempo
@@ -92,8 +92,8 @@ impl Instrument {
     }
 }
 
-async fn play(inst: &mut Instrument, channel: u8, map: EventMap) {
-    let events = map.get(&channel).cloned().unwrap_or_else(|| vec![]);
+async fn play(inst: &mut Instrument, track: u8, map: EventMap) {
+    let events = map.get(&track).cloned().unwrap_or_else(|| vec![]);
 
     for e in events {
         inst.add(e.note, e.time).await;
@@ -112,8 +112,8 @@ async fn main() -> Result<()> {
     .init();
 
     if opt.list {
-        let channels = midi::list(&opt.file)?;
-        info!("Available channels: {:?}", channels);
+        let tracks = midi::list(&opt.file)?;
+        info!("Available tracks: {:?}", tracks);
         return Ok(());
     }
 
@@ -142,21 +142,21 @@ async fn main() -> Result<()> {
     let tracks: Vec<_> = cubes
         .into_iter()
         .enumerate()
-        .map(|(channel, mut cube)| {
+        .map(|(track, mut cube)| {
             let events = events.clone();
             let begin = begin.clone();
             let end = end.clone();
 
             tokio::spawn(async move {
-                let channel = channel as u8;
+                let track = track as u8;
 
-                info!("Cube {} is ready", channel);
+                info!("Cube {} is ready", track);
 
                 // Turn on the light.
                 cube.light_on(
-                    ((channel % 7 + 1) & 1u8) * 255,
-                    ((channel % 7 + 1) >> 1u8 & 1u8) * 255,
-                    ((channel % 7 + 1) >> 2u8 & 1u8) * 255,
+                    ((track % 7 + 1) & 1u8) * 255,
+                    ((track % 7 + 1) >> 1u8 & 1u8) * 255,
+                    ((track % 7 + 1) >> 2u8 & 1u8) * 255,
                     None,
                 )
                 .await?;
@@ -164,9 +164,9 @@ async fn main() -> Result<()> {
                 begin.wait().await;
 
                 let mut inst = Instrument::new(cube);
-                play(&mut inst, channel, events).await;
+                play(&mut inst, track, events).await;
 
-                info!("Cube {} finishes playing", channel);
+                info!("Cube {} finishes playing", track);
 
                 if end.wait().await.is_leader() {
                     info!("Shutdown down in 5 seconds...");

@@ -18,16 +18,13 @@ pub struct Event {
 
 #[derive(Clone, Debug)]
 pub struct Rule {
-    channels: Vec<u8>,
-    as_channel: u8,
+    tracks: Vec<u8>,
+    as_track: u8,
 }
 
 impl Rule {
-    fn new(channels: Vec<u8>, as_channel: u8) -> Self {
-        Self {
-            channels,
-            as_channel,
-        }
+    fn new(tracks: Vec<u8>, as_track: u8) -> Self {
+        Self { tracks, as_track }
     }
 }
 
@@ -37,16 +34,16 @@ impl std::str::FromStr for Rule {
     fn from_str(s: &str) -> Result<Self> {
         if s.contains("=") {
             let mut iter = s.splitn(2, "=");
-            let as_channel = iter.next().ok_or_else(|| anyhow!("Invalid rule: {}", s))?;
-            let channels = iter.next().ok_or_else(|| anyhow!("Invalid rule: {}", s))?;
+            let as_track = iter.next().ok_or_else(|| anyhow!("Invalid rule: {}", s))?;
+            let tracks = iter.next().ok_or_else(|| anyhow!("Invalid rule: {}", s))?;
 
-            let as_channel = as_channel.parse().context(format!("Invalid rule: {}", s))?;
-            let channels: Result<Vec<_>> = channels
+            let as_track = as_track.parse().context(format!("Invalid rule: {}", s))?;
+            let tracks: Result<Vec<_>> = tracks
                 .split(",")
-                .map(|channel| Ok(channel.parse().context(format!("Invalid rule: {}", s))?))
+                .map(|track| Ok(track.parse().context(format!("Invalid rule: {}", s))?))
                 .collect();
 
-            Ok(Rule::new(channels?, as_channel))
+            Ok(Rule::new(tracks?, as_track))
         } else {
             Err(anyhow!("Invalid rule: {}", s))
         }
@@ -64,9 +61,9 @@ pub fn list(file: &Path) -> Result<Vec<u8>> {
     let mut reader = Reader::new(&mut handler, file).map_err(|e| anyhow!("{}", e))?;
     let _ = reader.read();
 
-    let mut channels: Vec<_> = handler.default().keys().cloned().collect();
-    channels.sort();
-    Ok(channels)
+    let mut tracks: Vec<_> = handler.default().keys().cloned().collect();
+    tracks.sort();
+    Ok(tracks)
 }
 
 pub fn load(file: &Path, unit: u64, tempo: u64, rules: &[Rule]) -> Result<EventMap> {
@@ -83,10 +80,7 @@ pub fn load(file: &Path, unit: u64, tempo: u64, rules: &[Rule]) -> Result<EventM
     }
 
     for rule in rules {
-        info!(
-            "Assign channels {:?} to cube {}",
-            rule.channels, rule.as_channel
-        );
+        info!("Assign tracks {:?} to cube {}", rule.tracks, rule.as_track);
         handler.merge(unit, &rule)?;
     }
 
@@ -97,11 +91,13 @@ struct MessageHandler {
     tempo: u64,
     map: HashMap<u8, VecDeque<Event>>,
     merged: EventMap,
+    track: u8,
 }
 
 impl MessageHandler {
     fn new(tempo: u64) -> Self {
         Self {
+            track: 0,
             tempo,
             map: HashMap::new(),
             merged: HashMap::new(),
@@ -123,13 +119,13 @@ impl MessageHandler {
     fn merge(&mut self, unit: u64, rule: &Rule) -> Result<()> {
         let mut merged = vec![];
         let seqs: Result<Vec<_>> = rule
-            .channels
+            .tracks
             .iter()
             .map(|ch| {
                 self.map
                     .get(ch)
                     .cloned()
-                    .ok_or_else(|| anyhow!("No such channel: {}", ch))
+                    .ok_or_else(|| anyhow!("No such track: {}", ch))
             })
             .collect();
         let mut seqs = seqs?;
@@ -198,9 +194,13 @@ impl MessageHandler {
             squashed.push(e);
         }
 
-        self.merged.insert(rule.as_channel, squashed);
+        self.merged.insert(rule.as_track, squashed);
 
         Ok(())
+    }
+
+    fn delta(&self, delta: u32) -> u64 {
+        (delta as u64) * 500 / self.tempo
     }
 }
 
@@ -215,16 +215,23 @@ impl Handler for MessageHandler {
         }
     }
 
-    fn meta_event(&mut self, _delta_time: u32, _event: &MetaEvent, _data: &Vec<u8>) {}
+    fn meta_event(&mut self, _delta: u32, _event: &MetaEvent, _data: &Vec<u8>) {}
 
     fn midi_event(&mut self, delta: u32, event: &MidiEvent) {
         trace!("delta time: {:>4}, MIDI event: {}", delta, event);
 
-        let delta = (delta as u64) * 500 / self.tempo;
+        let delta = self.delta(delta);
 
         match event {
-            MidiEvent::NoteOn { ch, note, velocity } => {
-                let events = self.map.entry(*ch).or_insert_with(|| VecDeque::new());
+            MidiEvent::NoteOn {
+                ch: _,
+                note,
+                velocity,
+            } => {
+                let events = self
+                    .map
+                    .entry(self.track)
+                    .or_insert_with(|| VecDeque::new());
 
                 if let Some(last) = events.back_mut() {
                     last.time = delta;
@@ -251,5 +258,7 @@ impl Handler for MessageHandler {
 
     fn sys_ex_event(&mut self, _delta_time: u32, _event: &SysExEvent, _data: &Vec<u8>) {}
 
-    fn track_change(&mut self) {}
+    fn track_change(&mut self) {
+        self.track += 1;
+    }
 }
