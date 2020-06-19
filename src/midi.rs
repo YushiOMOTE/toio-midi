@@ -207,6 +207,12 @@ impl MessageHandler {
 impl Handler for MessageHandler {
     fn header(&mut self, _format: u16, _track: u16, time_base: u16) {
         debug!("time_base: {:04x} {}", time_base, time_base);
+        if time_base & 0x8000 > 0 {
+            warn!("Unsupported time base");
+        } else {
+            // 60s/120 = 0.5s = 500ms => 1 = 500/480 msec
+            self.tempo = (time_base as u64) * self.tempo / 1000;
+        }
     }
 
     fn meta_event(&mut self, _delta_time: u32, _event: &MetaEvent, _data: &Vec<u8>) {}
@@ -214,7 +220,7 @@ impl Handler for MessageHandler {
     fn midi_event(&mut self, delta: u32, event: &MidiEvent) {
         trace!("delta time: {:>4}, MIDI event: {}", delta, event);
 
-        let delta = (delta as u64) * 1000 / self.tempo;
+        let delta = (delta as u64) * 500 / self.tempo;
 
         match event {
             MidiEvent::NoteOn { ch, note, velocity } => {

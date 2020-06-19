@@ -47,7 +47,9 @@ impl Instrument {
         }
     }
 
-    async fn add(&mut self, note: Note, mut msec: u64) {
+    async fn add(&mut self, note: Note, msec: u64) {
+        let mut msec = msec / 10 * 10;
+
         while msec > 0 {
             let d = msec.min(2550);
 
