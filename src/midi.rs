@@ -91,7 +91,7 @@ impl Raw {
     }
 
     fn tempoed(&self, time_base: u64) -> Tempoed {
-        let mut tempo = 0;
+        let mut tempo = 500000;
         let mut events = BTreeMap::new();
         let mut old_tempo_at = 0;
         let mut new_tempo_at = 0;
