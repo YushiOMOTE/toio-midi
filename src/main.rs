@@ -1,17 +1,48 @@
 mod midi;
 
-use anyhow::{anyhow, Error, Result};
+use anyhow::{anyhow, Context, Error, Result};
+use futures::prelude::*;
 use log::*;
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::path::PathBuf;
 use structopt::StructOpt;
-use toio::{Cube, Note, SoundOp};
-use tokio::{sync::Barrier, time::delay_for};
+use toio::{Cube, SoundOp};
+use tokio::time::{delay_for, delay_until, Duration, Instant};
 
-use crate::midi::{EventMap, Rule};
+use crate::midi::PlaySet;
+
+#[derive(Clone, Debug)]
+pub struct Rule {
+    chs: Vec<u8>,
+    as_ch: u8,
+}
+
+impl Rule {
+    fn new(chs: Vec<u8>, as_ch: u8) -> Self {
+        Self { chs, as_ch }
+    }
+}
+
+impl std::str::FromStr for Rule {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        if s.contains("=") {
+            let mut iter = s.splitn(2, "=");
+            let as_ch = iter.next().ok_or_else(|| anyhow!("Invalid rule: {}", s))?;
+            let chs = iter.next().ok_or_else(|| anyhow!("Invalid rule: {}", s))?;
+
+            let as_ch = as_ch.parse().context(format!("Invalid rule: {}", s))?;
+            let chs: Result<Vec<_>> = chs
+                .split(",")
+                .map(|ch| Ok(ch.parse().context(format!("Invalid rule: {}", s))?))
+                .collect();
+
+            Ok(Rule::new(chs?, as_ch))
+        } else {
+            Err(anyhow!("Invalid rule: {}", s))
+        }
+    }
+}
 
 #[derive(StructOpt)]
 struct Opt {
@@ -32,74 +63,15 @@ struct Opt {
     unit: u64,
 }
 
-struct Instrument {
-    cube: Cube,
-    ops: Vec<SoundOp>,
-    inst: Instant,
-}
-
-impl Instrument {
-    fn new(cube: Cube) -> Self {
-        Self {
-            cube,
-            ops: vec![],
-            inst: Instant::now(),
-        }
-    }
-
-    async fn add(&mut self, note: Note, msec: u64) {
-        let mut msec = msec / 10 * 10;
-
-        while msec > 0 {
-            let d = msec.min(2550);
-
-            let op = SoundOp::new(note, Duration::from_millis(d));
-            debug!("add {:?}", op);
-            self.ops.push(op);
-            if self.ops.len() == 59 {
-                self.play().await;
-            }
-
-            msec -= d;
-        }
-    }
-
-    async fn play(&mut self) {
-        let ops = self.ops.split_off(0);
-
-        if ops.is_empty() {
-            return;
-        }
-
-        let d = ops
-            .iter()
-            .fold(0u64, |s, op| s + op.duration.as_millis() as u64);
-
-        debug!(
-            "{}: play {:?} (len={}, delay={})",
-            self.inst.elapsed().as_millis(),
-            ops,
-            ops.len(),
-            d
-        );
-        let play = self.cube.play(1, ops);
-        let delay = delay_for(Duration::from_millis(d));
-
-        let (p, _) = futures::join!(play, delay);
-        p.unwrap();
-
-        debug!("{}", self.inst.elapsed().as_millis());
-    }
-}
-
-async fn play(inst: &mut Instrument, track: u8, map: EventMap, speed: u64) {
-    let events = map.get(&track).cloned().unwrap_or_else(|| vec![]);
-
-    for e in events {
-        inst.add(e.note, e.time * 100 / speed).await;
-    }
-
-    inst.play().await;
+fn ops(set: &PlaySet) -> Vec<SoundOp> {
+    assert!(set.plays.len() <= 59);
+    set.plays
+        .iter()
+        .map(|p| {
+            assert!(p.len <= 2550);
+            SoundOp::new(p.note, Duration::from_millis(p.len))
+        })
+        .collect()
 }
 
 #[tokio::main]
@@ -111,17 +83,30 @@ async fn main() -> Result<()> {
     )
     .init();
 
-    if opt.list {
-        let tracks = midi::list(&opt.file)?;
-        info!("Available tracks: {:?}", tracks);
-        return Ok(());
-    }
-
     if opt.speed == 0 {
         return Err(anyhow!("Speed must be non-zero"));
     }
 
-    let events = midi::load(&opt.file, opt.unit, &opt.rules)?;
+    if opt.list {
+        let events = midi::load(&opt.file)?;
+
+        let mut set = vec![];
+        for ((_, ch), _) in events {
+            set.push(ch);
+        }
+        set.sort();
+        set.dedup();
+        info!("Available tracks: {:?}", set);
+        return Ok(());
+    }
+
+    let events = if opt.rules.is_empty() {
+        midi::load(&opt.file)?
+    } else {
+        info!("Parsing file {}...", opt.file.display());
+        let rules: Vec<_> = opt.rules.iter().map(|r| (r.as_ch, r.chs.clone())).collect();
+        midi::load_mixed(&opt.file, opt.unit, &rules)?
+    };
 
     let mut cubes = Cube::search().all().await?;
 
@@ -129,66 +114,63 @@ async fn main() -> Result<()> {
         return Err(anyhow!("No cube found"));
     }
 
-    for cube in cubes.iter_mut() {
+    for (i, cube) in cubes.iter_mut().enumerate() {
         cube.connect().await?;
+
+        let p = opt
+            .rules
+            .iter()
+            .find(|p| p.as_ch == i as u8)
+            .map(|r| r.chs.iter().sum())
+            .unwrap_or(i as u8);
+        cube.light_on(
+            ((p % 7 + 1) & 1u8) * 255,
+            ((p % 7 + 1) >> 1u8 & 1u8) * 255,
+            ((p % 7 + 1) >> 2u8 & 1u8) * 255,
+            None,
+        )
+        .await?;
     }
 
-    let begin = Arc::new(Barrier::new(cubes.len() + 1));
-    let end = Arc::new(Barrier::new(cubes.len()));
-
-    let begin0 = begin.clone();
-    tokio::spawn(async move {
-        info!("Starts playing in 3 seconds...");
-        delay_for(Duration::from_secs(3)).await;
-        begin0.wait().await;
-    });
-
-    let tracks: Vec<_> = cubes
+    let cubes: Vec<_> = cubes
         .into_iter()
         .enumerate()
-        .map(|(track, mut cube)| {
-            let events = events.clone();
-            let begin = begin.clone();
-            let end = end.clone();
-            let speed = opt.speed;
-
+        .map(|(i, mut cube)| {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             tokio::spawn(async move {
-                let track = track as u8;
-
-                info!("Cube {} is ready", track);
-
-                // Turn on the light.
-                cube.light_on(
-                    ((track % 7 + 1) & 1u8) * 255,
-                    ((track % 7 + 1) >> 1u8 & 1u8) * 255,
-                    ((track % 7 + 1) >> 2u8 & 1u8) * 255,
-                    None,
-                )
-                .await?;
-
-                begin.wait().await;
-
-                let mut inst = Instrument::new(cube);
-                play(&mut inst, track, events, speed).await;
-
-                info!("Cube {} finishes playing", track);
-
-                if end.wait().await.is_leader() {
-                    info!("Shutdown down in 5 seconds...");
+                while let Some(p) = rx.next().await {
+                    cube.play(1, ops(&p))
+                        .await
+                        .context(format!("error on cube {}", i))?;
                 }
-
-                delay_for(Duration::from_secs(5)).await;
-
                 Ok::<_, Error>(())
-            })
+            });
+            tx
         })
         .collect();
 
-    for res in futures::future::join_all(tracks).await {
-        res??;
+    info!("Start playing in 3 seconds...");
+    delay_for(Duration::from_secs(3)).await;
+    info!("Started");
+
+    let start = Instant::now();
+    let mut last_at = 0;
+    for ((at, _), playset) in events {
+        debug!("At {}: {:?}", at, playset);
+
+        if last_at != at {
+            delay_until(start + Duration::from_millis(at)).await;
+        }
+        last_at = at;
+
+        if let Some(cube) = cubes.get(playset.ch as usize) {
+            let _ = cube.send(playset);
+        }
     }
 
-    info!("Finish");
+    info!("Shutting down in 3 seconds...");
+    delay_for(Duration::from_secs(3)).await;
+    info!("Done");
 
     Ok(())
 }

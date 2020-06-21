@@ -1,315 +1,340 @@
-use anyhow::{anyhow, Context, Error, Result};
-use ghakuf::messages::*;
-use ghakuf::reader::*;
+use anyhow::{anyhow, Result};
+use derive_new::new;
+use ghakuf::{messages::*, reader::*};
 use log::*;
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::convert::TryInto;
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, HashMap},
+    convert::TryInto,
+    path::Path,
+};
 use toio::Note;
 
-pub type EventMap = HashMap<u8, Vec<Event>>;
+pub type EventMap = BTreeMap<(Time, Channel), Play>;
+pub type Channel = u8;
+pub type Time = u64;
 
-#[derive(Clone, Debug)]
-pub struct Event {
+#[derive(Clone, Debug, PartialEq, Eq, new)]
+pub struct Play {
+    pub ch: Channel,
+    pub at: Time,
+    pub len: Time,
     pub note: Note,
-    pub time: u64,
-    pub at: u64,
 }
 
-impl Event {
-    fn new(note: Note, time: u64, at: u64) -> Self {
-        Self { note, time, at }
-    }
+#[derive(Clone, Debug, PartialEq, Eq, new)]
+pub struct PlaySet {
+    pub ch: Channel,
+    pub at: Time,
+    #[new(default)]
+    pub len: Time,
+    #[new(default)]
+    pub plays: Vec<Play>,
 }
 
-#[derive(Clone, Debug)]
-pub struct Rule {
-    tracks: Vec<u8>,
-    as_track: u8,
+#[derive(Clone, Debug, PartialEq, Eq, new)]
+pub enum Event {
+    Start(Start),
+    Stop(Stop),
+    Tempo(Tempo),
 }
 
-impl Rule {
-    fn new(tracks: Vec<u8>, as_track: u8) -> Self {
-        Self { tracks, as_track }
-    }
+#[derive(Clone, Debug, PartialEq, Eq, new)]
+pub struct Start {
+    ch: Channel,
+    note: Note,
 }
 
-impl std::str::FromStr for Rule {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        if s.contains("=") {
-            let mut iter = s.splitn(2, "=");
-            let as_track = iter.next().ok_or_else(|| anyhow!("Invalid rule: {}", s))?;
-            let tracks = iter.next().ok_or_else(|| anyhow!("Invalid rule: {}", s))?;
-
-            let as_track = as_track.parse().context(format!("Invalid rule: {}", s))?;
-            let tracks: Result<Vec<_>> = tracks
-                .split(",")
-                .map(|track| Ok(track.parse().context(format!("Invalid rule: {}", s))?))
-                .collect();
-
-            Ok(Rule::new(tracks?, as_track))
-        } else {
-            Err(anyhow!("Invalid rule: {}", s))
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq, new)]
+pub struct Stop {
+    ch: Channel,
 }
 
-pub fn list(file: &Path) -> Result<Vec<u8>> {
-    let mut handler = MessageHandler::new();
-    let mut reader = Reader::new(&mut handler, file).map_err(|e| anyhow!("{}", e))?;
-    let _ = reader.read();
-    handler.adjust();
-
-    let mut tracks: Vec<_> = handler.default().keys().cloned().collect();
-    tracks.sort();
-    Ok(tracks)
+#[derive(Clone, Debug, PartialEq, Eq, new)]
+pub struct Tempo {
+    ch: Channel,
+    tempo: u64,
 }
 
-pub fn load(file: &Path, unit: u64, rules: &[Rule]) -> Result<EventMap> {
-    let mut handler = MessageHandler::new();
-    let mut reader = Reader::new(&mut handler, file).map_err(|e| anyhow!("{}", e))?;
-    let _ = reader.read();
-    handler.adjust();
-
-    if rules.is_empty() {
-        info!("Use default track assignment rule");
-        return Ok(handler.default().clone());
-    }
-
-    for rule in rules {
-        info!("Assign tracks {:?} to cube {}", rule.tracks, rule.as_track);
-        handler.merge(unit, &rule)?;
-    }
-
-    Ok(handler.merged().clone())
+#[derive(Clone, Debug, Default, new)]
+struct Raw {
+    #[new(default)]
+    at: Time,
+    #[new(default)]
+    events: BTreeMap<(Time, Channel), Event>,
 }
 
-#[derive(Clone)]
-struct Track {
-    id: u8,
-    at: u64,
-    events: VecDeque<Event>,
-    tempo: BTreeMap<u64, u64>,
-}
-
-impl Track {
-    fn new(id: u8) -> Self {
-        Self {
-            id,
-            at: 0,
-            events: VecDeque::new(),
-            tempo: BTreeMap::new(),
-        }
-    }
-
-    fn delta(&mut self, delta: u32) {
-        let delta = delta as u64;
+impl Raw {
+    fn update(&mut self, delta: Time) {
         self.at += delta;
-
-        if let Some(last) = self.events.back_mut() {
-            last.time = delta;
-        }
     }
 
-    fn void(&mut self, delta: u32) {
-        self.delta(delta);
+    fn start(&mut self, ch: Channel, delta: Time, note: Note) {
+        self.update(delta);
+        self.events
+            .insert((self.at, ch), Event::Start(Start::new(ch, note)));
     }
 
-    fn tempo(&mut self, delta: u32, data: &[u8]) {
-        self.delta(delta);
+    fn stop(&mut self, ch: Channel, delta: Time) {
+        self.update(delta);
+        self.events
+            .insert((self.at, ch), Event::Stop(Stop::new(ch)));
+    }
 
+    fn tempo(&mut self, ch: Channel, delta: Time, tempo: u64) {
+        self.update(delta);
+        self.events
+            .insert((self.at, ch), Event::Tempo(Tempo::new(ch, tempo)));
+    }
+
+    fn end(&mut self) {
+        self.at = 0;
+    }
+
+    fn tempoed(&self, time_base: u64) -> Tempoed {
         let mut tempo = 0;
-        for d in data {
-            tempo *= 256;
-            tempo += *d as u64;
-        }
-
-        self.tempo.insert(self.at, tempo);
-    }
-
-    fn note(&mut self, delta: u32, note: u8, vel: u8) {
-        self.delta(delta);
-
-        self.events.push_back(Event::new(
-            if vel > 0 {
-                (note - 12).try_into().unwrap()
-            } else {
-                Note::NoSound
-            },
-            0,
-            self.at,
-        ));
-    }
-
-    fn adjust(&mut self, tempo: &BTreeMap<u64, u64>, time_base: u64) {
+        let mut events = BTreeMap::new();
+        let mut old_tempo_at = 0;
+        let mut new_tempo_at = 0;
         let mut new_at = 0;
-        self.events.iter_mut().for_each(|e| {
-            let mut s = e.at;
+        let mut notes = HashMap::new();
 
-            let (_, ctempo) = tempo.range(0..=s).last().expect("Unknown tempo");
-            let mut ctempo = *ctempo;
-            let mut t = tempo
-                .range(e.at..(e.at + e.time))
-                .fold(0, move |t, (at, tempo)| {
-                    let tt = (at - s) * ctempo / 1000 / time_base;
-                    s = *at;
-                    ctempo = *tempo;
-                    t + tt
-                });
-            t += (e.at + e.time - s) * ctempo / 1000 / time_base;
+        for ((at, _), event) in &self.events {
+            new_at = ((at - old_tempo_at) * tempo / 1000 / time_base + new_tempo_at) / 10 * 10;
 
-            e.time = t;
-            e.at = new_at;
-            new_at += t;
-        });
+            match event {
+                Event::Start(s) => {
+                    if let Some((start_at, note)) = notes.remove(&s.ch) {
+                        events.insert(
+                            (start_at, s.ch),
+                            Play::new(s.ch, start_at, new_at - start_at, note),
+                        );
+                    }
+                    notes.insert(s.ch, (new_at, s.note));
+                }
+                Event::Stop(s) => {
+                    if let Some((start_at, note)) = notes.remove(&s.ch) {
+                        events.insert(
+                            (start_at, s.ch),
+                            Play::new(s.ch, start_at, new_at - start_at, note),
+                        );
+                    }
+                }
+                Event::Tempo(t) => {
+                    old_tempo_at = *at;
+                    new_tempo_at = new_at;
+                    tempo = t.tempo;
+                }
+            }
+        }
+
+        for (ch, (start_at, note)) in notes {
+            events.insert(
+                (start_at, ch),
+                Play::new(ch, start_at, new_at - start_at, note),
+            );
+        }
+
+        Tempoed(events)
     }
 }
 
-struct MessageHandler {
-    track: u8,
-    tracks: HashMap<u8, Track>,
-    time_base: u64,
-    raw: EventMap,
-    merged: EventMap,
-}
+#[derive(Clone, Debug, PartialEq, Eq, new)]
+struct Tempoed(EventMap);
 
-impl MessageHandler {
-    fn new() -> Self {
-        Self {
-            track: 0,
-            tracks: HashMap::new(),
-            time_base: 0,
-            raw: HashMap::new(),
-            merged: HashMap::new(),
-        }
-    }
-
-    fn default(&self) -> &EventMap {
-        &self.raw
-    }
-
-    fn merged(&self) -> &EventMap {
-        &self.merged
-    }
-
-    /// Adjust events timing based on tempo
-    fn adjust(&mut self) {
-        let tempo: BTreeMap<_, _> = self
-            .tracks
-            .iter()
-            .map(|(_, track)| track.tempo.iter().map(|(k, v)| (k.clone(), v.clone())))
-            .flatten()
-            .collect();
-
-        for (_, track) in &mut self.tracks {
-            track.adjust(&tempo, self.time_base);
-        }
-
-        self.raw = self
-            .tracks
-            .clone()
-            .into_iter()
-            .map(|(k, v)| (k, v.events.into_iter().collect()))
-            .collect()
-    }
-
-    /// Merge some tracks into one track
-    fn merge(&mut self, unit: u64, rule: &Rule) -> Result<()> {
-        let mut merged = vec![];
-        let tracks: Result<Vec<_>> = rule
-            .tracks
-            .iter()
-            .map(|t| {
-                self.tracks
-                    .get(t)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("No such track: {}", t))
-            })
-            .collect();
-        let mut tracks = tracks?;
-        let mut at = 0;
-
-        let slice = 1;
-
-        for i in 0.. {
-            let mut notes = HashMap::new();
-            let mut nodata = true;
-
-            trace!("---");
-
-            for (ch, track) in tracks.iter_mut().enumerate() {
-                let e = match track.events.front() {
-                    Some(e) => e.clone(),
-                    None => continue,
-                };
-                nodata = false;
-
-                trace!("{}-{}: ch={}: {:?}", at, at + slice, ch, e);
-
-                if !(e.at + e.time < at || at + slice <= e.at) && e.note != Note::NoSound {
-                    notes.insert(ch, Event::new(e.note, slice, at));
-                }
-
-                if e.at + e.time <= at + slice {
-                    track.events.pop_front();
-                }
+fn mix(mixed: &mut EventMap, orig: &EventMap, unit: u64, as_ch: u8, chs: &[u8]) {
+    if chs.len() == 1 {
+        for ((at, ch), play) in orig {
+            if chs.contains(ch) {
+                let mut p = play.clone();
+                p.ch = as_ch;
+                mixed.insert((*at, as_ch), p);
             }
+        }
+        return;
+    }
 
-            if nodata {
-                break;
-            }
+    let mut on: Vec<Play> = vec![];
+    let mut last = None::<Play>;
+    let mut iter = orig.iter().peekable();
 
-            if notes.is_empty() {
-                trace!("* {}-{}: no sound", at, at + slice);
-                merged.push(Event::new(Note::NoSound, slice, at))
-            } else if notes.len() == 1 {
-                let e = notes.values().next().unwrap().clone();
-                trace!("* {}-{}: {:?}", at, at + slice, e);
-                merged.push(e);
+    for at in 0.. {
+        if !on.is_empty() {
+            let mut play = on[(at / unit) as usize % on.len()].clone();
+            play.at = at;
+            play.len = 1;
+
+            if let Some(mut l) = last.take() {
+                // If the item is same as the previous one, merge.
+                if l.ch == play.ch && l.at + l.len == play.at && l.note == play.note {
+                    l.len += 1;
+                    last = Some(l);
+                } else {
+                    l.ch = as_ch;
+                    mixed.insert((l.at, as_ch), l);
+                    last = Some(play);
+                }
             } else {
-                let mut chs: Vec<_> = notes.keys().collect();
-                chs.sort();
-                let ch = chs[(i / unit as usize) % chs.len()];
-                let e = notes.get(ch).unwrap().clone();
-                trace!("* {}-{}: {:?} (ch={})", at, at + slice, e, ch);
-                merged.push(e);
+                last = Some(play);
             }
-
-            notes.clear();
-
-            at += slice;
         }
 
-        let mut squashed: Vec<Event> = vec![];
+        on.retain(|play| at < play.at + play.len);
 
-        for e in merged {
-            if let Some(last) = squashed.last_mut() {
-                if last.note == e.note {
-                    last.time += e.time;
+        let play = match iter.peek() {
+            Some(((play_at, ch), play)) if *play_at <= at => {
+                if !chs.contains(ch) {
+                    iter.next();
                     continue;
+                } else {
+                    play
                 }
             }
-            squashed.push(e);
-        }
+            Some(_) => continue,
+            None => break,
+        };
 
-        self.merged.insert(rule.as_track, squashed);
+        on.push((*play).clone());
 
-        Ok(())
+        iter.next();
     }
 
-    fn track(&mut self) -> &mut Track {
-        let track = self.track;
-        self.tracks
-            .entry(self.track)
-            .or_insert_with(|| Track::new(track))
+    if let Some(mut l) = last.take() {
+        l.ch = as_ch;
+        mixed.insert((l.at, as_ch), l);
     }
 }
 
-impl Handler for MessageHandler {
+impl Tempoed {
+    fn mixed(&self, unit: u64, rules: &[(u8, Vec<u8>)]) -> Tempoed {
+        let mut mixed = BTreeMap::new();
+
+        for (as_ch, chs) in rules {
+            mix(&mut mixed, &self.0, unit, *as_ch, &chs);
+        }
+
+        Tempoed(mixed)
+    }
+
+    fn merged(&self, size: usize, maxlen: Time) -> Merged {
+        let mut merged = BTreeMap::new();
+        let mut chs = HashMap::new();
+
+        for ((at, _), play) in &self.0 {
+            let mut play = play.clone();
+            let mut rem = play.len;
+
+            while rem > 0 {
+                play.len = rem.min(maxlen);
+
+                // Operations on gaps
+                {
+                    enum Op {
+                        Flush,
+                        Fill(Time, Time),
+                        None,
+                    }
+
+                    let set = chs
+                        .entry(play.ch)
+                        .or_insert_with(|| PlaySet::new(play.ch, *at));
+
+                    let op = if let Some(last) = set.plays.last() {
+                        if last.at + last.len + maxlen < play.at {
+                            // Gap is longer than maxlen, flush.
+                            Op::Flush
+                        } else if last.at + last.len < play.at {
+                            // Gap is shorter than maxlen, fill.
+                            Op::Fill(last.at + last.len, play.at - (last.at + last.len))
+                        } else {
+                            // No gap.
+                            Op::None
+                        }
+                    } else {
+                        // No last.
+                        Op::None
+                    };
+
+                    match op {
+                        Op::Flush => {
+                            merged.insert((set.at, set.ch), set.clone());
+
+                            let ch = set.ch;
+                            chs.remove(&ch);
+                        }
+                        Op::Fill(at, len) => {
+                            set.plays.push(Play::new(play.ch, at, len, Note::NoSound));
+                            if set.plays.len() == size {
+                                merged.insert((set.at, set.ch), set.clone());
+
+                                let ch = set.ch;
+                                chs.remove(&ch);
+                            }
+                        }
+                        Op::None => {}
+                    }
+                }
+
+                let set = chs
+                    .entry(play.ch)
+                    .or_insert_with(|| PlaySet::new(play.ch, *at));
+                set.len += play.len;
+                set.plays.push(play.clone());
+                if set.plays.len() == size {
+                    merged.insert((set.at, set.ch), set.clone());
+
+                    let ch = set.ch;
+                    chs.remove(&ch);
+                }
+
+                play.at += play.len;
+                rem -= play.len;
+            }
+        }
+
+        for (_, set) in chs {
+            merged.insert((set.at, set.ch), set.clone());
+        }
+
+        Merged(merged)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, new)]
+pub struct Merged(BTreeMap<(Time, Channel), PlaySet>);
+
+#[derive(Clone, Debug, new)]
+struct Processor {
+    #[new(default)]
+    time_base: u64,
+    #[new(default)]
+    ch: u8,
+    #[new(default)]
+    raw: Raw,
+}
+
+impl Processor {
+    fn finalize(&self, size: usize, maxlen: Time) -> Merged {
+        self.raw.tempoed(self.time_base).merged(size, maxlen)
+    }
+
+    fn finalize_mixed(
+        &self,
+        size: usize,
+        maxlen: Time,
+        unit: u64,
+        rules: &[(u8, Vec<u8>)],
+    ) -> Merged {
+        self.raw
+            .tempoed(self.time_base)
+            .mixed(unit, rules)
+            .merged(size, maxlen)
+    }
+}
+
+impl Handler for Processor {
     fn header(&mut self, _format: u16, _track: u16, time_base: u16) {
         debug!("time_base: {:04x} {}", time_base, time_base);
+
         if time_base & 0x8000 > 0 {
             warn!("Unsupported time base");
             self.time_base = 480;
@@ -319,20 +344,31 @@ impl Handler for MessageHandler {
     }
 
     fn meta_event(&mut self, delta: u32, event: &MetaEvent, data: &Vec<u8>) {
-        trace!("delta time: {:>4}, meta event: {}", delta, event);
+        debug!(
+            "{}: delta time: {:>4}, meta event: {}",
+            self.ch, delta, event
+        );
 
         match event {
             MetaEvent::SetTempo => {
-                self.track().tempo(delta, &data);
+                let mut tempo = 0u64;
+                for d in data {
+                    tempo *= 256;
+                    tempo += *d as u64;
+                }
+                self.raw.tempo(self.ch, delta as u64, tempo);
             }
             _ => {
-                self.track().void(delta);
+                self.raw.update(delta as u64);
             }
         }
     }
 
     fn midi_event(&mut self, delta: u32, event: &MidiEvent) {
-        trace!("delta time: {:>4}, MIDI event: {}", delta, event);
+        debug!(
+            "{}: delta time: {:>4}, MIDI event: {}",
+            self.ch, delta, event
+        );
 
         match event {
             MidiEvent::NoteOn {
@@ -340,24 +376,143 @@ impl Handler for MessageHandler {
                 note,
                 velocity,
             } => {
-                self.track().note(delta, *note, *velocity);
+                if *velocity > 0 {
+                    self.raw
+                        .start(self.ch, delta as u64, (*note - 12).try_into().unwrap());
+                } else {
+                    self.raw.stop(self.ch, delta as u64);
+                }
             }
             MidiEvent::NoteOff {
                 ch: _,
                 note: _,
                 velocity: _,
             } => {
-                self.track().note(delta, 0, 0);
+                self.raw.stop(self.ch, delta as u64);
             }
             _ => {
-                self.track().void(delta);
+                self.raw.update(delta as u64);
             }
         }
     }
 
-    fn sys_ex_event(&mut self, _delta_time: u32, _event: &SysExEvent, _data: &Vec<u8>) {}
+    fn sys_ex_event(&mut self, delta: u32, _event: &SysExEvent, _data: &Vec<u8>) {
+        debug!("{}: ex event: {:>4}", self.ch, delta);
+        self.raw.update(delta as u64);
+    }
 
     fn track_change(&mut self) {
-        self.track += 1;
+        self.raw.end();
+        self.ch += 1;
+    }
+}
+
+fn proc<P: AsRef<Path>>(p: P) -> Result<Processor> {
+    let mut proc = Processor::new();
+    let mut reader = Reader::new(&mut proc, p.as_ref()).map_err(|e| anyhow!("{}", e))?;
+    let _ = reader.read();
+    Ok(proc)
+}
+
+pub fn load<P: AsRef<Path>>(p: P) -> Result<BTreeMap<(Time, Channel), PlaySet>> {
+    Ok(proc(p)?.finalize(59, 2550).0)
+}
+
+pub fn load_mixed<P: AsRef<Path>>(
+    p: P,
+    unit: u64,
+    rules: &[(u8, Vec<u8>)],
+) -> Result<BTreeMap<(Time, Channel), PlaySet>> {
+    Ok(proc(p)?.finalize_mixed(59, 2550, unit, rules).0)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn raw() {
+        let mut r = Raw::new();
+        r.start(0, 100, Note::C3);
+        r.start(0, 200, Note::D3);
+        r.start(0, 100, Note::E3);
+        r.stop(0, 300);
+
+        let es: Vec<_> = r.events.into_iter().map(|((at, _), v)| (at, v)).collect();
+        assert_eq!(
+            es,
+            vec![
+                (100u64, Event::Start(Start::new(0, Note::C3))),
+                (300u64, Event::Start(Start::new(0, Note::D3))),
+                (400u64, Event::Start(Start::new(0, Note::E3))),
+                (700u64, Event::Stop(Stop::new(0)))
+            ]
+        );
+    }
+
+    #[test]
+    fn tempoed() {
+        let mut r = Raw::new();
+        r.tempo(0, 0, 500000);
+        r.start(0, 100, Note::C3);
+        r.start(0, 200, Note::D3);
+        r.start(0, 100, Note::E3);
+        r.stop(0, 300);
+
+        // 500msec / 100 = 5msec <=> 1
+        let t = r.tempoed(100);
+
+        let es: Vec<_> = t.0.into_iter().map(|((at, _), v)| (at, v)).collect();
+        assert_eq!(
+            es,
+            vec![
+                (500u64, Play::new(0, 500, 1000, Note::C3)),
+                (1500u64, Play::new(0, 1500, 500, Note::D3)),
+                (2000u64, Play::new(0, 2000, 1500, Note::E3)),
+            ]
+        );
+    }
+
+    fn p(ch: Channel, at: Time, len: Time, plays: Vec<Play>) -> PlaySet {
+        PlaySet { ch, at, len, plays }
+    }
+
+    #[test]
+    fn merged() {
+        let mut r = Raw::new();
+
+        r.tempo(0, 0, 500000);
+
+        for i in 0..3 {
+            r.start(i, 100, Note::C3);
+            r.start(i, 200, Note::D3);
+            r.start(i, 100, Note::E3);
+            r.stop(i, 300);
+            r.end();
+        }
+
+        // 1 = 5msec
+        // Max is large enough
+        let t = r.tempoed(100).merged(1000, 2500);
+
+        let es: Vec<_> = t.0.into_iter().map(|((at, _), v)| (at, v)).collect();
+        assert_eq!(
+            es,
+            (0..3)
+                .map(|i| (
+                    500,
+                    p(
+                        i,
+                        500,
+                        3000,
+                        vec![
+                            Play::new(i, 500, 1000, Note::C3),
+                            Play::new(i, 1500, 500, Note::D3),
+                            Play::new(i, 2000, 1500, Note::E3)
+                        ]
+                    )
+                ))
+                .collect::<Vec<_>>()
+        );
     }
 }

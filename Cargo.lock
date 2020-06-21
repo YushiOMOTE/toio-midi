@@ -873,6 +873,7 @@ name = "toio-midi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "derive-new",
  "env_logger",
  "futures",
  "ghakuf",

@@ -13,3 +13,4 @@ toio = "0.1"
 tokio = { version = "0.2", features = ["full"] }
 futures = "0.3"
 anyhow = "1.0"
+derive-new = "0.5"
