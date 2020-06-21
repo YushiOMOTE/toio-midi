@@ -156,6 +156,7 @@ async fn main() -> Result<()> {
 
     let start = Instant::now();
     let mut last_at = 0;
+    let mut tail = 0;
     for ((at, _), playset) in events {
         debug!("At {}: {:?}", at, playset);
 
@@ -165,9 +166,11 @@ async fn main() -> Result<()> {
         last_at = at;
 
         if let Some(cube) = cubes.get(playset.ch as usize) {
+            tail = playset.len;
             let _ = cube.send(playset);
         }
     }
+    delay_for(Duration::from_millis(tail)).await;
 
     info!("Shutting down in 3 seconds...");
     delay_for(Duration::from_secs(3)).await;
