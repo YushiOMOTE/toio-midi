@@ -60,6 +60,8 @@ struct Raw {
     #[new(default)]
     at: Time,
     #[new(default)]
+    notes: HashMap<Note, Time>,
+    #[new(default)]
     events: BTreeMap<(Time, Channel), Event>,
 }
 
@@ -68,16 +70,14 @@ impl Raw {
         self.at += delta;
     }
 
-    fn start(&mut self, ch: Channel, delta: Time, note: Note) {
+    fn on(&mut self, ch: Channel, delta: Time, note: Note) {
         self.update(delta);
-        self.events
-            .insert((self.at, ch), Event::Start(Start::new(ch, note)));
+        self.onoff(ch, note, true);
     }
 
-    fn stop(&mut self, ch: Channel, delta: Time) {
+    fn off(&mut self, ch: Channel, delta: Time, note: Note) {
         self.update(delta);
-        self.events
-            .insert((self.at, ch), Event::Stop(Stop::new(ch)));
+        self.onoff(ch, note, false);
     }
 
     fn tempo(&mut self, ch: Channel, delta: Time, tempo: u64) {
@@ -86,8 +86,41 @@ impl Raw {
             .insert((self.at, ch), Event::Tempo(Tempo::new(ch, tempo)));
     }
 
-    fn end(&mut self) {
+    fn end(&mut self, ch: Channel) {
+        if !self.notes.is_empty() {
+            self.events
+                .insert((self.at, ch), Event::Stop(Stop::new(ch)));
+        }
+        self.notes.clear();
         self.at = 0;
+    }
+
+    fn onoff(&mut self, ch: Channel, note: Note, on: bool) {
+        let old = self.note();
+        if on {
+            self.notes.insert(note, self.at);
+        } else {
+            self.notes.remove(&note);
+        }
+        let new = self.note();
+
+        if old != new {
+            if let Some(_) = old {
+                self.events
+                    .insert((self.at, ch), Event::Stop(Stop::new(ch)));
+            }
+            if let Some(note) = new {
+                self.events
+                    .insert((self.at, ch), Event::Start(Start::new(ch, note)));
+            }
+        }
+    }
+
+    fn note(&self) -> Option<Note> {
+        self.notes
+            .iter()
+            .max_by(|p, q| p.1.cmp(q.1))
+            .map(|(k, _)| *k)
     }
 
     fn tempoed(&self, time_base: u64) -> Tempoed {
@@ -378,17 +411,19 @@ impl Handler for Processor {
             } => {
                 if *velocity > 0 {
                     self.raw
-                        .start(self.ch, delta as u64, (*note - 12).try_into().unwrap());
+                        .on(self.ch, delta as u64, (*note - 12).try_into().unwrap());
                 } else {
-                    self.raw.stop(self.ch, delta as u64);
+                    self.raw
+                        .off(self.ch, delta as u64, (*note - 12).try_into().unwrap());
                 }
             }
             MidiEvent::NoteOff {
                 ch: _,
-                note: _,
+                note,
                 velocity: _,
             } => {
-                self.raw.stop(self.ch, delta as u64);
+                self.raw
+                    .off(self.ch, delta as u64, (*note - 12).try_into().unwrap());
             }
             _ => {
                 self.raw.update(delta as u64);
@@ -402,7 +437,7 @@ impl Handler for Processor {
     }
 
     fn track_change(&mut self) {
-        self.raw.end();
+        self.raw.end(self.ch);
         self.ch += 1;
     }
 }
@@ -433,10 +468,12 @@ mod test {
     #[test]
     fn raw() {
         let mut r = Raw::new();
-        r.start(0, 100, Note::C3);
-        r.start(0, 200, Note::D3);
-        r.start(0, 100, Note::E3);
-        r.stop(0, 300);
+        r.on(0, 100, Note::C3);
+        r.on(0, 200, Note::D3);
+        r.on(0, 100, Note::E3);
+        r.off(0, 300, Note::C3);
+        r.off(0, 0, Note::D3);
+        r.off(0, 0, Note::E3);
 
         let es: Vec<_> = r.events.into_iter().map(|((at, _), v)| (at, v)).collect();
         assert_eq!(
@@ -454,10 +491,12 @@ mod test {
     fn tempoed() {
         let mut r = Raw::new();
         r.tempo(0, 0, 500000);
-        r.start(0, 100, Note::C3);
-        r.start(0, 200, Note::D3);
-        r.start(0, 100, Note::E3);
-        r.stop(0, 300);
+        r.on(0, 100, Note::C3);
+        r.on(0, 200, Note::D3);
+        r.on(0, 100, Note::E3);
+        r.off(0, 300, Note::C3);
+        r.off(0, 0, Note::D3);
+        r.off(0, 0, Note::E3);
 
         // 500msec / 100 = 5msec <=> 1
         let t = r.tempoed(100);
@@ -484,11 +523,12 @@ mod test {
         r.tempo(0, 0, 500000);
 
         for i in 0..3 {
-            r.start(i, 100, Note::C3);
-            r.start(i, 200, Note::D3);
-            r.start(i, 100, Note::E3);
-            r.stop(i, 300);
-            r.end();
+            r.on(i, 100, Note::C3);
+            r.on(i, 200, Note::D3);
+            r.on(i, 100, Note::E3);
+            r.off(i, 300, Note::C3);
+            r.off(i, 0, Note::D3);
+            r.off(i, 0, Note::E3);
         }
 
         // 1 = 5msec
