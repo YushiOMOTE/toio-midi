@@ -116,6 +116,7 @@ async fn main() -> Result<()> {
 
     for (i, cube) in cubes.iter_mut().enumerate() {
         cube.connect().await?;
+        info!("Cube {} connected", i);
 
         let p = opt
             .rules

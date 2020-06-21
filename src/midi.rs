@@ -119,7 +119,7 @@ impl Raw {
     fn note(&self) -> Option<Note> {
         self.notes
             .iter()
-            .max_by(|p, q| p.1.cmp(q.1))
+            .min_by(|p, q| p.1.cmp(q.1))
             .map(|(k, _)| *k)
     }
 
