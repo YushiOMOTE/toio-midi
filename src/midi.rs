@@ -119,7 +119,7 @@ impl Raw {
     fn note(&self) -> Option<Note> {
         self.notes
             .iter()
-            .min_by(|p, q| p.1.cmp(q.1))
+            .max_by(|p, q| p.1.cmp(q.1))
             .map(|(k, _)| *k)
     }
 
@@ -529,6 +529,7 @@ mod test {
             r.off(i, 300, Note::C3);
             r.off(i, 0, Note::D3);
             r.off(i, 0, Note::E3);
+            r.end(i);
         }
 
         // 1 = 5msec
